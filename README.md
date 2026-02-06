@@ -594,7 +594,147 @@ if __name__ == "__main__":
 
 ---
 
+## 双节点训练 32B 模型问题总结
+
+> **重要结论**: 对于 Qwen2.5-32B LoRA 微调任务，**双节点 DDP 是最优选择**。虽然每 step 速度相同，但双节点的 batch size 翻倍，总 steps 减半，训练时间缩短一半。FSDP 模式因通信开销过大，不推荐使用。
+
+### 性能对比
+
+| 训练模式 | 速度 (s/step) | Steps 数 | 预估总时间 | 推荐 |
+|----------|---------------|----------|------------|------|
+| 单节点 | ~24 | 1,482 | ~10 小时 | |
+| **双节点 DDP** | ~24 | **741** | **~5 小时** | ✅ 推荐 |
+| 双节点 FSDP (FULL_SHARD) | ~67 | 741 | ~13.8 小时 | ❌ |
+| 双节点 FSDP (SHARD_GRAD_OP) | ~114 | 741 | ~23 小时 | ❌ |
+
+**关键发现**: 双节点 DDP 和单节点每 step 速度相同 (~24s)，但因为 world_size=2 使得有效 batch size 翻倍，总 steps 从 1,482 减少到 741，训练时间缩短一半！
+
+### 遇到的问题
+
+#### 1. NCCL 通信初始化问题
+
+**现象**: 训练卡在 `ncclCommInitRankConfig ... Init START`
+
+**原因**: Node B 上存在僵尸进程，导致新旧进程冲突
+
+**解决**: 强制杀死所有 Python 进程后重启
+```bash
+ssh gx10@172.16.100.2 'pkill -9 -f python; pkill -9 -f accelerate'
+```
+
+#### 2. MTU 配置不当
+
+**现象**: 网络带宽未充分利用
+
+**原因**: 200G RoCE 网卡默认 MTU=1500，应使用 Jumbo Frames
+
+**解决**: 修改 MTU 为 9000
+```bash
+sudo ip link set enp1s0f0np0 mtu 9000  # 两节点都需执行
+```
+
+**效果**: Ping 延迟从 ~1ms 降到 ~0.26ms，但对训练速度影响有限
+
+#### 3. GPU Direct RDMA 不可用
+
+**现象**: NCCL 日志显示 `GPU Direct RDMA Disabled for HCA`
+
+**原因**: Blackwell (sm_121) + ARM64 平台 GDR 支持不完整
+
+**影响**: 数据传输需经过 CPU 复制，增加延迟
+
+**状态**: 等待 NVIDIA 驱动/固件更新
+
+#### 4. Node B 数据文件缺失
+
+**现象**: `ValueError: File /home/gx10/train/data/buddhist_train_alpaca.json not found`
+
+**原因**: Node A 上的数据文件是符号链接，rsync 同步后 Node B 上链接目标不存在
+
+**解决**: 复制实际文件而非符号链接
+```bash
+scp ~/buddhist-llm-finetune/output/buddhist_train_alpaca.json gx10@172.16.100.2:~/train/data/
+```
+
+#### 5. FSDP 通信开销过大
+
+**现象**: 双节点训练比单节点慢 70+ 倍
+
+**分析**:
+- 32B 模型 (bf16) = 64GB
+- FSDP FULL_SHARD: 每个 step 需 all-gather (64GB) + reduce-scatter (64GB) = 128GB 通信
+- 200Gbps = 25GB/s 理论带宽
+- 理论最小通信时间 = 128GB / 25GB/s ≈ 5s/step
+- 实际 67s/step，说明还有其他开销 (CPU 复制、同步等待)
+
+**根本原因**: 
+- 每节点仅 1 个 GPU，通信/计算比过高
+- 训练数据量小 (3,947 样本)，无法摊薄通信成本
+
+#### 6. DDP 模式是最优解
+
+**尝试**: 改用 DDP 模式 (只同步 LoRA 梯度 134MB，而非整个模型 64GB)
+
+**结果**: 
+- 每 step 速度: ~24s (与单节点相同)
+- 总 steps: 741 (单节点的一半，因为 batch size 翻倍)
+- 总时间: ~5 小时 (单节点的一半)
+
+**原因**: DDP 只需同步梯度，通信量小 (134MB vs FSDP 的 64GB)，通信开销可忽略不计
+
+### 何时应该使用双节点
+
+| 场景 | 推荐方案 |
+|------|----------|
+| LoRA 微调 32B 模型 | **双节点 DDP** ✅ |
+| 模型 > 128GB (如 70B 全参) | 双节点 FSDP |
+| 单节点内存不足 | 双节点 FSDP |
+| 节点内有多 GPU (8×H100) | 多节点 DDP/FSDP |
+
+### 优化建议
+
+1. **LoRA 微调用 DDP**: 通信量小，双节点能有效加速
+2. **全参微调用 FSDP**: 模型太大必须分片
+3. **避免 FSDP 用于 LoRA**: 通信开销远大于收益
+4. **检查 MTU**: 确保使用 Jumbo Frames (MTU 9000)
+5. **清理僵尸进程**: 启动前确保两节点无残留进程
+
+### 配置文件参考
+
+#### 单节点配置 (推荐)
+
+`accelerate_config_single.yaml`:
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: 'NO'
+mixed_precision: bf16
+num_machines: 1
+num_processes: 1
+use_cpu: false
+```
+
+#### 双节点 DDP 配置 (如需要)
+
+`accelerate_config_ddp_node0.yaml`:
+```yaml
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+machine_rank: 0
+main_process_ip: 172.16.100.1
+main_process_port: 29500
+mixed_precision: bf16
+num_machines: 2
+num_processes: 2
+rdzv_backend: static
+same_network: true
+use_cpu: false
+```
+
+---
+
 ## 更新日志
 
 - **2026-02-05**: 初始环境搭建完成
-- **2026-02-06**: 模型下载中，文档编写完成
+- **2026-02-06**: 模型下载完成
+- **2026-02-06**: 双节点训练测试完成，发现 FSDP 性能问题
+- **2026-02-06**: 确认双节点 DDP 是最优方案 (5小时 vs 单节点10小时)，修正文档
