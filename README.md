@@ -1,0 +1,600 @@
+# DGX Spark 双节点分布式训练环境搭建指南
+
+本文档详细记录了在双节点 NVIDIA DGX Spark (GX10) 集群上搭建 Qwen2.5-32B-Instruct LoRA 微调环境的完整过程。
+
+## 目录
+
+1. [硬件配置](#硬件配置)
+2. [网络拓扑](#网络拓扑)
+3. [软件环境搭建](#软件环境搭建)
+4. [NCCL 编译](#nccl-编译)
+5. [训练配置](#训练配置)
+6. [模型下载](#模型下载)
+7. [启动训练](#启动训练)
+8. [故障排除](#故障排除)
+
+---
+
+## 硬件配置
+
+### 节点规格
+
+| 项目 | 规格 |
+|------|------|
+| 型号 | NVIDIA DGX Spark (ASUS GX10) |
+| CPU | ARM64 (aarch64) |
+| GPU | NVIDIA GB10 (Blackwell 架构, sm_121) |
+| 内存 | 128GB 统一内存 (GPU/CPU 共享) |
+| CUDA | 13.0 |
+| 操作系统 | Ubuntu 24.04 |
+
+### 节点信息
+
+| 节点 | 主机名 | 管理网 IP | 200G RoCE IP | 角色 |
+|------|--------|-----------|--------------|------|
+| Node A | gx10-beee | 192.168.34.100 | 172.16.100.1 | Ray Head / Rank 0 |
+| Node B | gx10-c6fb | 192.168.34.101 | 172.16.100.2 | Ray Worker / Rank 1 |
+
+### 互联网络
+
+- **200Gbps RoCE** via NVIDIA ConnectX-7
+- 网段: 172.16.100.0/24
+- 用途: NCCL 集合通信
+
+---
+
+## 网络拓扑
+
+```
+┌─────────────────┐     200G RoCE      ┌─────────────────┐
+│   Node A        │◄──────────────────►│   Node B        │
+│   gx10-beee     │   172.16.100.x     │   gx10-c6fb     │
+│   GB10 GPU      │                    │   GB10 GPU      │
+│   128GB Unified │                    │   128GB Unified │
+└─────────────────┘                    └─────────────────┘
+       │                                      │
+       │ 1GbE 管理网                          │ 1GbE 管理网
+       │ 192.168.34.100                       │ 192.168.34.101
+       └──────────────────┬───────────────────┘
+                          │
+                    ┌─────▼─────┐
+                    │  交换机    │
+                    └───────────┘
+```
+
+---
+
+## 软件环境搭建
+
+### 1. 安装 Miniforge (两节点)
+
+DGX Spark 使用 ARM64 架构，需要使用 Miniforge 而非 Anaconda:
+
+```bash
+# 下载 ARM64 版本
+wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
+
+# 安装到 ~/miniforge3
+bash Miniforge3-Linux-aarch64.sh -b -p ~/miniforge3
+
+# 初始化
+~/miniforge3/bin/conda init bash
+source ~/.bashrc
+```
+
+### 2. 创建训练环境 (Node A)
+
+```bash
+# 创建 Python 3.12 环境
+conda create -n buddhist-train python=3.12 -y
+conda activate buddhist-train
+
+# 安装 PyTorch 2.9.0 with CUDA 13.0 (nightly)
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
+
+# 安装训练依赖
+pip install transformers==4.57.1
+pip install peft==0.17.1
+pip install accelerate==1.11.0
+pip install datasets
+pip install trl
+pip install scipy
+
+# 安装 LLaMA-Factory
+pip install llamafactory==0.9.4
+```
+
+### 3. 复制环境到 Node B
+
+使用 conda-pack 打包并通过 200G 链路传输:
+
+```bash
+# Node A: 打包环境
+conda activate buddhist-train
+pip install conda-pack
+conda pack -n buddhist-train -o buddhist-train.tar.gz
+
+# 通过 200G 链路传输 (约 754 MB/s)
+rsync -avP --compress buddhist-train.tar.gz gx10@172.16.100.2:~/
+
+# Node B: 解压环境
+ssh gx10@192.168.34.101
+mkdir -p ~/miniforge3/envs/buddhist-train
+tar -xzf buddhist-train.tar.gz -C ~/miniforge3/envs/buddhist-train
+conda activate buddhist-train
+conda-unpack  # 修复硬编码路径
+```
+
+### 4. 验证环境一致性
+
+```bash
+# 两节点分别执行
+python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+python -c "import transformers; print(f'Transformers: {transformers.__version__}')"
+python -c "import peft; print(f'PEFT: {peft.__version__}')"
+python -c "import accelerate; print(f'Accelerate: {accelerate.__version__}')"
+```
+
+---
+
+## NCCL 编译
+
+### 为什么需要自编译 NCCL
+
+DGX Spark 使用 Blackwell 架构 (sm_121)，官方预编译的 NCCL 可能不包含此架构支持。需要从源码编译。
+
+### 编译步骤 (两节点)
+
+```bash
+# 克隆 NCCL 源码
+git clone https://github.com/NVIDIA/nccl.git ~/nccl
+cd ~/nccl
+
+# 编译 (支持 sm_121)
+make -j$(nproc) src.build NVCC_GENCODE="-gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_121,code=sm_121"
+
+# 验证
+ls ~/nccl/build/lib/libnccl.so*
+```
+
+### 配置环境变量
+
+创建 `~/train/scripts/env_setup.sh`:
+
+```bash
+#!/bin/bash
+
+# NCCL 库路径
+export LD_LIBRARY_PATH=$HOME/nccl/build/lib:$LD_LIBRARY_PATH
+
+# NCCL RoCE 配置
+export NCCL_IB_HCA=mlx5_0
+export NCCL_IB_GID_INDEX=3
+export NCCL_SOCKET_IFNAME=enp5s0  # 200G 网卡
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
+
+# 分布式训练
+export MASTER_ADDR=172.16.100.1
+export MASTER_PORT=29500
+
+# PyTorch 配置
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+### 验证 NCCL 通信
+
+创建测试脚本 `test_nccl.py`:
+
+```python
+import os
+import torch
+import torch.distributed as dist
+
+def main():
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    device = torch.device("cuda")
+    
+    # 创建测试张量
+    tensor = torch.ones(1024 * 1024 * 256, dtype=torch.float32, device=device)  # 1GB
+    
+    # 测试 allreduce
+    import time
+    start = time.time()
+    for _ in range(10):
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    torch.cuda.synchronize()
+    elapsed = time.time() - start
+    
+    if rank == 0:
+        bandwidth = (10 * 1024 * 2) / elapsed  # MB/s (双向)
+        print(f"AllReduce bandwidth: {bandwidth:.1f} MB/s ({bandwidth/1024:.1f} GB/s)")
+    
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
+```
+
+运行测试:
+
+```bash
+# Node A
+source ~/train/scripts/env_setup.sh
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=0 \
+    --master_addr=172.16.100.1 --master_port=29500 \
+    test_nccl.py
+
+# Node B (同时执行)
+source ~/train/scripts/env_setup.sh
+torchrun --nnodes=2 --nproc_per_node=1 --node_rank=1 \
+    --master_addr=172.16.100.1 --master_port=29500 \
+    test_nccl.py
+```
+
+预期输出: `AllReduce bandwidth: ~12.4 GB/s`
+
+---
+
+## 训练配置
+
+### 目录结构
+
+```
+~/train/
+├── accelerate_config_node0.yaml  # Node A FSDP 配置
+├── accelerate_config_node1.yaml  # Node B FSDP 配置
+├── train_config.yaml             # LLaMA-Factory 配置
+├── data/
+│   ├── buddhist_train_alpaca.json
+│   ├── buddhist_val_alpaca.json
+│   └── dataset_info.json
+└── scripts/
+    ├── env_setup.sh
+    ├── launch_train.sh
+    ├── test_sdpa.py
+    └── test_nccl.py
+```
+
+### Accelerate FSDP 配置
+
+`accelerate_config_node0.yaml` (Node A, rank=0):
+
+```yaml
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: FSDP
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+fsdp_config:
+  fsdp_activation_checkpointing: true
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_cpu_ram_efficient_loading: false
+  fsdp_forward_prefetch: false
+  fsdp_offload_params: false
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_sync_module_states: true
+  fsdp_use_orig_params: true
+machine_rank: 0
+main_process_ip: 172.16.100.1
+main_process_port: 29500
+main_training_function: main
+mixed_precision: bf16
+num_machines: 2
+num_processes: 2
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+```
+
+Node B 配置相同，仅 `machine_rank: 1`。
+
+### 关键配置决策
+
+| 配置项 | 选择 | 原因 |
+|--------|------|------|
+| `fsdp_offload_params: false` | 不 offload | 统一内存架构，offload 无意义 |
+| `fsdp_state_dict_type: SHARDED_STATE_DICT` | 分片保存 | 避免检查点 OOM |
+| `mixed_precision: bf16` | BF16 混合精度 | Blackwell 原生支持 |
+| `fsdp_activation_checkpointing: true` | 启用 | 32B 模型必需 |
+
+### LLaMA-Factory 训练配置
+
+`train_config.yaml`:
+
+```yaml
+### Model
+model_name_or_path: ~/models/Qwen2.5-32B-Instruct
+
+### Method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.05
+
+### Dataset
+dataset: buddhist_train
+dataset_dir: ~/train/data
+template: qwen
+cutoff_len: 2048
+preprocessing_num_workers: 8
+
+### Output
+output_dir: ~/train/output
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+
+### Training
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+gradient_checkpointing: true
+
+### Evaluation
+val_size: 0.0
+per_device_eval_batch_size: 1
+eval_strategy: "no"
+```
+
+### 数据集配置
+
+`data/dataset_info.json`:
+
+```json
+{
+  "buddhist_train": {
+    "file_name": "buddhist_train_alpaca.json",
+    "formatting": "alpaca"
+  },
+  "buddhist_val": {
+    "file_name": "buddhist_val_alpaca.json",
+    "formatting": "alpaca"
+  }
+}
+```
+
+---
+
+## 模型下载
+
+### 模型信息
+
+- **模型**: Qwen2.5-32B-Instruct
+- **大小**: ~62GB (17 个 safetensors 分片)
+- **来源**: ModelScope (国内访问更快)
+
+### 下载脚本
+
+```bash
+#!/bin/bash
+MODEL_DIR=~/models/Qwen2.5-32B-Instruct
+mkdir -p $MODEL_DIR
+cd $MODEL_DIR
+
+BASE_URL="https://modelscope.cn/models/Qwen/Qwen2.5-32B-Instruct/resolve/master"
+
+# 下载配置文件
+for f in config.json generation_config.json tokenizer.json tokenizer_config.json \
+         vocab.json merges.txt model.safetensors.index.json; do
+    wget -c "$BASE_URL/$f"
+done
+
+# 并行下载模型分片 (4 并发)
+for i in $(seq -w 1 17); do
+    wget -c --tries=20 --retry-connrefused --timeout=120 \
+        -O "model-000${i}-of-00017.safetensors" \
+        "$BASE_URL/model-000${i}-of-00017.safetensors" &
+    
+    # 限制并发数
+    if (( $(jobs -r | wc -l) >= 4 )); then
+        wait -n
+    fi
+done
+wait
+```
+
+### 同步到 Node B
+
+```bash
+# 使用 200G 链路同步 (约 754 MB/s)
+rsync -avP --compress ~/models/Qwen2.5-32B-Instruct/ \
+    gx10@172.16.100.2:~/models/Qwen2.5-32B-Instruct/
+```
+
+---
+
+## 启动训练
+
+### 启动脚本
+
+`scripts/launch_train.sh`:
+
+```bash
+#!/bin/bash
+NODE_RANK=${1:-0}
+
+# 加载环境
+source ~/train/scripts/env_setup.sh
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate buddhist-train
+
+cd ~/train
+
+# 选择配置文件
+if [ "$NODE_RANK" = "0" ]; then
+    CONFIG=accelerate_config_node0.yaml
+else
+    CONFIG=accelerate_config_node1.yaml
+fi
+
+# 启动训练
+accelerate launch --config_file $CONFIG \
+    --main_process_ip 172.16.100.1 \
+    --main_process_port 29500 \
+    --machine_rank $NODE_RANK \
+    --num_machines 2 \
+    --num_processes 2 \
+    -m llamafactory.train train_config.yaml
+```
+
+### 执行步骤
+
+**Node A (Rank 0)**:
+```bash
+source ~/train/scripts/env_setup.sh
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate buddhist-train
+bash ~/train/scripts/launch_train.sh 0
+```
+
+**Node B (Rank 1)** - 同时执行:
+```bash
+source ~/train/scripts/env_setup.sh
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate buddhist-train
+bash ~/train/scripts/launch_train.sh 1
+```
+
+或从 Node A 远程启动 Node B:
+```bash
+ssh gx10@192.168.34.101 "source ~/train/scripts/env_setup.sh && \
+    source ~/miniforge3/etc/profile.d/conda.sh && \
+    conda activate buddhist-train && \
+    bash ~/train/scripts/launch_train.sh 1"
+```
+
+---
+
+## 故障排除
+
+### 常见问题
+
+#### 1. sm_121 架构警告
+
+```
+UserWarning: CUDA Architecture sm_121 is not yet fully supported
+```
+
+**解决**: 忽略此警告。PyTorch 2.9.0 在 sm_121 上正常工作。
+
+#### 2. NCCL 初始化失败
+
+```
+NCCL error: unhandled system error
+```
+
+**检查项**:
+- 确认 200G 网络连通: `ping 172.16.100.2`
+- 确认 NCCL 环境变量已设置
+- 确认防火墙开放端口 29500
+
+#### 3. FlashAttention 编译失败
+
+**原因**: FlashAttention 不支持 sm_121 (Blackwell)
+
+**解决**: 使用 PyTorch 原生 SDPA (Scaled Dot Product Attention):
+```python
+# 验证 SDPA 可用
+import torch
+print(torch.backends.cuda.flash_sdp_enabled())  # 应返回 True
+```
+
+#### 4. DeepSpeed 初始化失败
+
+**原因**: DeepSpeed C++/CUDA JIT 在 ARM64+CUDA13+sm_121 未经测试
+
+**解决**: 使用 FSDP 替代 DeepSpeed
+
+#### 5. 内存不足 (OOM)
+
+**调整**:
+- 减小 `cutoff_len` (如 1024)
+- 减小 `per_device_train_batch_size` (如 1)
+- 确认 `gradient_checkpointing: true`
+
+### 监控命令
+
+```bash
+# GPU 使用情况
+nvidia-smi -l 1
+
+# NCCL 调试日志
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=ALL
+
+# 训练进度
+tail -f ~/train/output/trainer_log.jsonl
+```
+
+---
+
+## 附录
+
+### 验证测试脚本
+
+#### SDPA 测试 (test_sdpa.py)
+
+```python
+import torch
+import torch.nn.functional as F
+
+def test_sdpa():
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    
+    B, H, S, D = 2, 32, 1024, 128
+    q = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(B, H, S, D, device=device, dtype=dtype, requires_grad=True)
+    
+    with torch.backends.cuda.sdp_kernel(
+        enable_flash=True, 
+        enable_math=False, 
+        enable_mem_efficient=False
+    ):
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        loss = out.sum()
+        loss.backward()
+    
+    print(f"SDPA test passed!")
+    print(f"  Output shape: {out.shape}")
+    print(f"  flash_sdp enabled: {torch.backends.cuda.flash_sdp_enabled()}")
+
+if __name__ == "__main__":
+    test_sdpa()
+```
+
+### 环境版本参考
+
+| 组件 | 版本 |
+|------|------|
+| Python | 3.12 |
+| PyTorch | 2.9.0+cu130 |
+| Transformers | 4.57.1 |
+| PEFT | 0.17.1 |
+| Accelerate | 1.11.0 |
+| LLaMA-Factory | 0.9.4 |
+| CUDA | 13.0 |
+| NCCL | 2.28.9 (自编译) |
+
+---
+
+## 更新日志
+
+- **2026-02-05**: 初始环境搭建完成
+- **2026-02-06**: 模型下载中，文档编写完成
