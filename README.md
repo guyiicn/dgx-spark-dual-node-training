@@ -732,9 +732,69 @@ use_cpu: false
 
 ---
 
+## 训练结果
+
+### Qwen2.5-32B-Instruct 佛经知识 LoRA 微调
+
+**训练配置**:
+- 基础模型: Qwen2.5-32B-Instruct
+- 微调方法: LoRA (r=8, alpha=16)
+- 训练数据: 3,947 条佛经知识问答 (CBETA 语料)
+- 验证数据: 439 条
+- 训练模式: 双节点 DDP (2× NVIDIA GB10)
+
+**训练参数**:
+| 参数 | 值 |
+|------|-----|
+| Epochs | 3 |
+| Batch Size (per device) | 1 |
+| Gradient Accumulation | 8 |
+| Effective Batch Size | 16 (2 nodes × 1 × 8) |
+| Learning Rate | 4e-5 |
+| Warmup Ratio | 0.1 |
+| Max Length | 2048 |
+| LoRA Rank | 8 |
+| LoRA Alpha | 16 |
+| Trainable Params | 134,217,728 (0.41%) |
+
+**训练结果**:
+| 指标 | 值 |
+|------|-----|
+| 训练时长 | 5:46:55 |
+| 总 Steps | 741 |
+| Train Loss | 1.2977 |
+| Eval Loss | 1.4564 |
+| 速度 | ~24 s/step |
+| 训练样本/秒 | 0.569 |
+
+**输出文件**:
+```
+~/train/saves/qwen2.5-32b-buddhist-lora/
+├── adapter_config.json
+├── adapter_model.safetensors
+├── chat_template.jinja
+├── special_tokens_map.json
+├── tokenizer_config.json
+└── tokenizer.json
+```
+
+**Loss 曲线分析**:
+- 初始 Loss: ~2.15
+- 最终 Train Loss: 1.30
+- Eval Loss: 1.46 (轻微过拟合，但可接受)
+
+**验证结论**:
+- ✅ 双节点 DDP 训练成功完成
+- ✅ 训练时间符合预期 (~5.8h vs 预估 5h)
+- ✅ Loss 正常收敛
+- ⏳ 待测试: 模型问答效果
+
+---
+
 ## 更新日志
 
 - **2026-02-05**: 初始环境搭建完成
 - **2026-02-06**: 模型下载完成
 - **2026-02-06**: 双节点训练测试完成，发现 FSDP 性能问题
 - **2026-02-06**: 确认双节点 DDP 是最优方案 (5小时 vs 单节点10小时)，修正文档
+- **2026-02-06**: Qwen2.5-32B 佛经 LoRA 微调完成 (5:46:55, train_loss=1.30, eval_loss=1.46)
