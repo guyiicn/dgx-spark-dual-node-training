@@ -787,7 +787,51 @@ use_cpu: false
 - ✅ 双节点 DDP 训练成功完成
 - ✅ 训练时间符合预期 (~5.8h vs 预估 5h)
 - ✅ Loss 正常收敛
-- ⏳ 待测试: 模型问答效果
+- ⚠️ 推理测试受限 (见下文)
+
+---
+
+## 推理测试限制
+
+### GB10 上 32B 模型推理问题
+
+**现象**: 32B 模型推理极慢，单次问答超过 5 分钟
+
+**原因分析**:
+- GB10 GPU 有 128GB 统一内存
+- Qwen2.5-32B (bf16) 需要 ~64GB
+- 加载 LoRA 适配器后，部分参数被 offload 到 CPU
+- CPU 参与推理导致速度下降 10-100 倍
+
+**验证方式**:
+```
+Some parameters are on the meta device because they were offloaded to the cpu.
+```
+
+**影响**:
+- ❌ 标准基准测试 (CMMLU/C-Eval) 不可行 - 耗时过长
+- ❌ 自定义问答测试不可行 - 每样本需 10+ 分钟
+- ❌ 困惑度测试不可行 - 需要遍历大量数据
+
+**解决方案**:
+1. **使用更小的模型测试**: 7B/14B 模型可在 GB10 上流畅推理
+2. **使用更强硬件评估**: 在 A100/H100 等高端 GPU 上测试
+3. **量化推理**: 使用 GPTQ/AWQ 4-bit 量化减少内存占用
+4. **部署为 API 服务**: 使用 vLLM 等框架优化推理
+
+### 测试脚本 (待硬件升级后使用)
+
+已准备的测试脚本位于 `~/train/eval/`:
+
+| 脚本 | 用途 |
+|------|------|
+| `buddhist_qa_test.py` | 佛经问答测试 |
+| `perplexity_compare.py` | 困惑度对比 |
+| `eval_bleu_rouge.py` | BLEU/ROUGE 评估 |
+| `eval_cmmlu.yaml` | CMMLU 基准配置 |
+| `eval_ceval.yaml` | C-Eval 基准配置 |
+
+**注意**: LLaMA-Factory v0.9.4 已废弃 `eval` 命令，需使用 `lm-evaluation-harness` 替代。
 
 ---
 
@@ -798,3 +842,4 @@ use_cpu: false
 - **2026-02-06**: 双节点训练测试完成，发现 FSDP 性能问题
 - **2026-02-06**: 确认双节点 DDP 是最优方案 (5小时 vs 单节点10小时)，修正文档
 - **2026-02-06**: Qwen2.5-32B 佛经 LoRA 微调完成 (5:46:55, train_loss=1.30, eval_loss=1.46)
+- **2026-02-07**: 发现 GB10 上 32B 模型推理受限 (部分 offload 到 CPU)，准备测试脚本待后续使用
