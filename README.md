@@ -787,51 +787,86 @@ use_cpu: false
 - ✅ 双节点 DDP 训练成功完成
 - ✅ 训练时间符合预期 (~5.8h vs 预估 5h)
 - ✅ Loss 正常收敛
-- ⚠️ 推理测试受限 (见下文)
+- ✅ 推理测试通过 (见下文)
 
 ---
 
-## 推理测试限制
+## 推理评估结果
 
-### GB10 上 32B 模型推理问题
+### 关键修复：禁止 CPU Offload
 
-**现象**: 32B 模型推理极慢，单次问答超过 5 分钟
+**问题**: 默认加载方式会将部分参数 offload 到 CPU，导致推理极慢
 
-**原因分析**:
-- GB10 GPU 有 128GB 统一内存
-- Qwen2.5-32B (bf16) 需要 ~64GB
-- 加载 LoRA 适配器后，部分参数被 offload 到 CPU
-- CPU 参与推理导致速度下降 10-100 倍
+**解决方案**: 设置 `max_memory = {0: '100GiB', 'cpu': '0GiB'}` 禁止 CPU offload
 
-**验证方式**:
+```python
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    torch_dtype=torch.bfloat16,
+    device_map='auto',
+    max_memory={0: '100GiB', 'cpu': '0GiB'},  # 关键！
+    trust_remote_code=True
+)
 ```
-Some parameters are on the meta device because they were offloaded to the cpu.
-```
 
-**影响**:
-- ❌ 标准基准测试 (CMMLU/C-Eval) 不可行 - 耗时过长
-- ❌ 自定义问答测试不可行 - 每样本需 10+ 分钟
-- ❌ 困惑度测试不可行 - 需要遍历大量数据
+### 评估结果汇总
 
-**解决方案**:
-1. **使用更小的模型测试**: 7B/14B 模型可在 GB10 上流畅推理
-2. **使用更强硬件评估**: 在 A100/H100 等高端 GPU 上测试
-3. **量化推理**: 使用 GPTQ/AWQ 4-bit 量化减少内存占用
-4. **部署为 API 服务**: 使用 vLLM 等框架优化推理
+#### 1. 困惑度对比 (50 样本)
 
-### 测试脚本 (待硬件升级后使用)
+| 模型 | 困惑度 | Loss |
+|------|--------|------|
+| 基础模型 | 8.88 | 2.18 |
+| 微调模型 | **5.02** | 1.61 |
+| **改进** | **43.5%** ⬇️ | |
 
-已准备的测试脚本位于 `~/train/eval/`:
+困惑度降低 43.5%，说明模型对佛经语料的理解能力显著提升。
+
+#### 2. 佛经问答测试 (20 样本)
+
+| 指标 | 值 |
+|------|-----|
+| BLEU-4 | 6.16% |
+| ROUGE-L | 21.93% |
+| 平均响应时间 | 45.1s/样本 |
+| GPU 内存占用 | 61.5 GB |
+
+**样例输出**:
+
+Q: 请解释《楞伽经》中'五法'的内在逻辑关系
+
+A: 《楞伽经》所立'五法'（相、名、妄想、正智、如如）并非并列分类，而是揭示心识从迷到悟的完整认知次第。首先，'相'指一切可被感知的现象形态（如色声香味触等），本无自性，唯是因缘假立；'名'则是人为安立的概念标签...
+
+#### 3. 推理性能
+
+| 指标 | 值 |
+|------|-----|
+| 生成速度 | ~3.3 tokens/s |
+| 100 tokens 时间 | ~30s |
+| GPU 内存 | 61.5 / 119.6 GB |
+| CPU Offload | 无 |
+
+### 评估脚本
+
+测试脚本位于 `~/train/eval/`:
 
 | 脚本 | 用途 |
 |------|------|
-| `buddhist_qa_test.py` | 佛经问答测试 |
-| `perplexity_compare.py` | 困惑度对比 |
+| `buddhist_qa_test_v2.py` | 佛经问答测试 (优化版) |
+| `perplexity_compare_v2.py` | 困惑度对比 (优化版) |
 | `eval_bleu_rouge.py` | BLEU/ROUGE 评估 |
-| `eval_cmmlu.yaml` | CMMLU 基准配置 |
-| `eval_ceval.yaml` | C-Eval 基准配置 |
 
-**注意**: LLaMA-Factory v0.9.4 已废弃 `eval` 命令，需使用 `lm-evaluation-harness` 替代。
+**运行示例**:
+```bash
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate buddhist-train
+cd ~/train/eval
+
+# 佛经问答测试
+python buddhist_qa_test_v2.py --max_samples 20
+
+# 困惑度对比
+python perplexity_compare_v2.py --max_samples 50
+```
 
 ---
 
@@ -842,4 +877,4 @@ Some parameters are on the meta device because they were offloaded to the cpu.
 - **2026-02-06**: 双节点训练测试完成，发现 FSDP 性能问题
 - **2026-02-06**: 确认双节点 DDP 是最优方案 (5小时 vs 单节点10小时)，修正文档
 - **2026-02-06**: Qwen2.5-32B 佛经 LoRA 微调完成 (5:46:55, train_loss=1.30, eval_loss=1.46)
-- **2026-02-07**: 发现 GB10 上 32B 模型推理受限 (部分 offload 到 CPU)，准备测试脚本待后续使用
+- **2026-02-07**: 解决推理 offload 问题，完成模型评估 (困惑度降低43.5%, BLEU-4=6.16%, ROUGE-L=21.93%)
