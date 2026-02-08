@@ -870,6 +870,35 @@ python perplexity_compare_v2.py --max_samples 50
 
 ---
 
+## 双机 PP=2 推理评估
+
+> 详见 [EVAL_PP2_RESULTS.md](EVAL_PP2_RESULTS.md) — 完整的微调 vs 基座对比报告。
+
+### 速览
+
+使用 vLLM PP=2 (Pipeline Parallel) 在双机上部署 32B 模型，对微调模型和基座模型进行标准化对比测试：
+
+| 评估维度 | 微调模型 | 基座模型 |
+|----------|----------|----------|
+| 佛经问答深度 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ |
+| 经典原文引用 | ⭐⭐⭐⭐⭐ | ⭐⭐ |
+| 通用能力保持 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
+| 推理性能 (PP=2) | 3.5 tok/s | 3.5 tok/s |
+
+**结论**: LoRA 微调成功，佛经问答从"百科词条级"提升到"佛学研究者级"，通用能力无退化，推理性能无损失。
+
+### 相关文件
+
+| 文件 | 说明 |
+|------|------|
+| [DGX-Spark-vLLM-双节点部署指南.md](DGX-Spark-vLLM-双节点部署指南.md) | vLLM PP=2 部署踩坑全记录 |
+| [EVAL_PP2_RESULTS.md](EVAL_PP2_RESULTS.md) | 双机推理评估完整报告 |
+| [scripts/start_vllm_buddhist_server.sh](scripts/start_vllm_buddhist_server.sh) | vLLM PP=2 启动脚本 |
+| [scripts/run_single_model_test.py](scripts/run_single_model_test.py) | 评估测试套件 |
+| [results/](results/) | 测试结果 JSON 文件 |
+
+---
+
 ## 更新日志
 
 - **2026-02-05**: 初始环境搭建完成
@@ -878,3 +907,5 @@ python perplexity_compare_v2.py --max_samples 50
 - **2026-02-06**: 确认双节点 DDP 是最优方案 (5小时 vs 单节点10小时)，修正文档
 - **2026-02-06**: Qwen2.5-32B 佛经 LoRA 微调完成 (5:46:55, train_loss=1.30, eval_loss=1.46)
 - **2026-02-07**: 解决推理 offload 问题，完成模型评估 (困惑度降低43.5%, BLEU-4=6.16%, ROUGE-L=21.93%)
+- **2026-02-08**: 双机 PP=2 推理部署完成 (解决 TP→PP、Triton、LoRA merge 等问题)
+- **2026-02-08**: 微调 vs 基座对比测试完成 (10 QA + 8 通用题，佛经显著提升，通用能力无退化)
