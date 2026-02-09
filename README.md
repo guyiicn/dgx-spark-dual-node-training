@@ -887,12 +887,33 @@ python perplexity_compare_v2.py --max_samples 50
 
 **结论**: LoRA 微调成功，佛经问答从"百科词条级"提升到"佛学研究者级"，通用能力无退化，推理性能无损失。
 
+---
+
+## 72B 基座模型对比评估
+
+> 详见 [EVAL_72B_RESULTS.md](EVAL_72B_RESULTS.md) — 72B vs 32B 三模型完整对比报告。
+
+### 速览
+
+在双机 PP=2 上部署 Qwen2.5-72B-Instruct (136GB, 37 shards)，与 32B 微调模型和 32B 基座模型进行三方对比：
+
+| 评估维度 | 72B 基座 | 32B 微调 | 32B 基座 | 最优 |
+|----------|---------|---------|---------|------|
+| 佛经问答深度 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 32B 微调 |
+| 经典原文引用 | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐ | 32B 微调 |
+| 通用能力 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | 持平 |
+| 推理速度 | 1.6 tok/s | 3.5 tok/s | 3.5 tok/s | 32B |
+| 性价比 | ⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 32B 微调 |
+
+**核心结论**: 即使模型规模扩大 2.25 倍 (72B vs 32B)，也无法弥补领域微调带来的知识深度和原文引用能力。对于佛学专业问答场景，32B 微调模型在质量和速度上均优于 72B 基座。
+
 ### 相关文件
 
 | 文件 | 说明 |
 |------|------|
 | [DGX-Spark-vLLM-双节点部署指南.md](DGX-Spark-vLLM-双节点部署指南.md) | vLLM PP=2 部署踩坑全记录 |
-| [EVAL_PP2_RESULTS.md](EVAL_PP2_RESULTS.md) | 双机推理评估完整报告 |
+| [EVAL_PP2_RESULTS.md](EVAL_PP2_RESULTS.md) | 双机 32B 推理评估报告 |
+| [EVAL_72B_RESULTS.md](EVAL_72B_RESULTS.md) | 72B vs 32B 三模型对比报告 |
 | [scripts/start_vllm_buddhist_server.sh](scripts/start_vllm_buddhist_server.sh) | vLLM PP=2 启动脚本 |
 | [scripts/run_single_model_test.py](scripts/run_single_model_test.py) | 评估测试套件 |
 | [results/](results/) | 测试结果 JSON 文件 |
@@ -909,3 +930,5 @@ python perplexity_compare_v2.py --max_samples 50
 - **2026-02-07**: 解决推理 offload 问题，完成模型评估 (困惑度降低43.5%, BLEU-4=6.16%, ROUGE-L=21.93%)
 - **2026-02-08**: 双机 PP=2 推理部署完成 (解决 TP→PP、Triton、LoRA merge 等问题)
 - **2026-02-08**: 微调 vs 基座对比测试完成 (10 QA + 8 通用题，佛经显著提升，通用能力无退化)
+- **2026-02-09**: 72B 基座模型部署并完成三模型对比评估 (72B base vs 32B finetuned vs 32B base)
+- **2026-02-09**: 核心结论: 领域微调不可替代，32B 微调在佛学问答上优于 72B 基座且速度快 2.15 倍
